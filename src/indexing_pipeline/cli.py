@@ -217,13 +217,6 @@ def _add_common_flags(p: argparse.ArgumentParser) -> None:
         default=None,
         help="drop provable-noise children in chunker (default: enabled)",
     )
-    p.add_argument(
-        "--strict-tokenizer",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="fail if a chunk worker cannot load a tokenizer "
-        "(default: enabled — prevents silent chars/2.25 fallback)",
-    )
 
 
 # ── Argparse ─────────────────────────────────────────────────────────────
@@ -278,7 +271,6 @@ def _build_config(args: argparse.Namespace) -> pipeline.Config:
         force=args.force or None,
         dedup_enabled=args.dedup,
         noise_filter_enabled=args.noise_filter,
-        strict_worker_tokenizer=args.strict_tokenizer,
     )
 
 

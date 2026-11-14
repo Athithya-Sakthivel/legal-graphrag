@@ -79,6 +79,9 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             processed = skipped = failed = 0
             case_ids = sorted(plan.keys())
 
+            # Load intentionally dropped cases to avoid counting them as failures
+            dropped_cases = self._get_dropped_cases()
+
             logger.info("embed starting: %d cases, device=%s", len(case_ids), self.config.device)
             embedder = self._get_embedder()
             logger.info("embed model loaded, beginning batched inference")
@@ -89,6 +92,12 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                 pending: list[tuple[int, PlanEntry, list[dict]]] = []
                 for case_id in case_batch:
                     plan_entry = plan[case_id]
+
+                    # Skip intentionally dropped cases
+                    if case_id in dropped_cases:
+                        skipped += 1
+                        processed += 1
+                        continue
 
                     # Check if chunk output is valid on disk
                     if not self._is_valid_chunk_output(case_id, plan_entry):
@@ -355,9 +364,16 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             if embed_failures:
                 raise PipelineError("load", "precondition: unresolved embedding failures")
 
+            # Load intentionally dropped cases to avoid counting them as missing
+            dropped_cases = self._get_dropped_cases()
+
             # Verify all planned cases have valid chunk and embed outputs on disk
             valid_case_ids = []
             for case_id, plan_entry in plan.items():
+                # CRITICAL: Skip cases intentionally dropped by the chunker quality filter
+                if case_id in dropped_cases:
+                    continue
+
                 if not self._is_valid_chunk_output(case_id, plan_entry):
                     raise PipelineError("load", f"missing or invalid chunk output for {case_id}")
                 if not self._is_valid_embed_output(case_id):

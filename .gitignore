@@ -260,3 +260,4 @@ models/logs
 
 logs_ik
 outputs.txt
+*.dump

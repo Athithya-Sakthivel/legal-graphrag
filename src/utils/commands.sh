@@ -1,4 +1,13 @@
 
+cd /workspace/src
+source .venv/bin/activate
+export PG_PASS=${PG_PASS:-e6a1c2e5bf8d}
+export DATABASE_URL="postgresql://legalrag:${PG_PASS}@127.0.0.1:5432/legalrag"
+export MODEL=/workspace/src/indexing_pipeline/embedders
+export CORPUS_ROWS=50000
+
+python -m indexing_pipeline.cli drop-index
+python -m indexing_pipeline.cli all --embed-batch 32 --inference-threads 8 --log-level INFO
 
 
 # 1. Persistent volume (survives container restarts)

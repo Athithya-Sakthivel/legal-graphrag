@@ -467,6 +467,13 @@ class IndexingPipelineBase:
         except Exception:
             return False
 
+    def _get_dropped_cases(self) -> set[int]:
+        """Load the set of case IDs intentionally dropped by the chunker's quality filter."""
+        drops_path = self.config.chunked_dir / "_corruption_drops.jsonl"
+        if not drops_path.is_file():
+            return set()
+        return {int(row["case_id"]) for row in read_jsonl(drops_path) if "case_id" in row}
+
     # ── Halt handling ───────────────────────────────────────────────
 
     def _is_halted(self, stage: str) -> bool:
@@ -839,6 +846,9 @@ class IndexingPipeline(LoadMixin, IndexingPipelineBase):
                             failures.pop(case_id, None)
                         else:
                             output_path = self._chunked_file(case_id)
+                            # Inject source_text_hash into the first row for resume validation
+                            if chunks:
+                                chunks[0]["source_text_hash"] = plan[case_id].source_text_hash
                             atomic_write_jsonl(output_path, chunks)
                             failures.pop(case_id, None)
 

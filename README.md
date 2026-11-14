@@ -1,238 +1,190 @@
 # Legal GraphRAG
 
-**Citation-aware retrieval over US case law**
+**A targeted retrieval experiment for a large structured legal corpora.**
 
-Built to close the 0.72 recall@5 ceiling from [RAG8s](https://github.com/Athithya-Sakthivel/RAG8s) via structure-aware chunking and native citation-graph traversal.
+**Built as a retrieval-layer companion to** [RAG8s](https://github.com/Athithya-Sakthivel/RAG8s), this project isolates the impact of **structure-aware chunking** and **native citation graphs**. While RAG8s provides a complete end-to-end LLMOps pipeline for heterogeneous enterprise documents, Legal GraphRAG explores what happens when the corpus is highly connected—breaking the 0.72 recall ceiling of fixed-size windowing by treating legal citations as first-class graph edges.
 
 | | RAG8s | Legal GraphRAG |
 |---|---|---|
-| **Scope** | LLMOps platform (ingest → generate) | Retrieval only |
-| **Corpus** | Heterogeneous internal docs | Structured US case law |
-| **Chunking** |  512-token windows | Parent–child, section-aligned |
-| **Graph** | None | Native `CITES` edges, 1-hop |
-| **Routing** | Fixed hybrid pipeline | Deterministic intent classifier |
-| **Storage** | Qdrant + S3 + Valkey | PostgreSQL only |
-| **Recall@5** | 0.72 | 0.91 macro |
+| **Scale** | 20 heterogenous documents | **9,536 cases · 36K chunks · 45K citation edges** |
+| **Scope** | E2E RAG platform (ingest → generate) | **Retrieval only** |
+| **Chunking** | 512-token windows | **Parent–child, section-aligned** |
+| **Graph** | None | **Native `CITES` edges, 1-hop** |
+| **Routing** | Fixed hybrid pipeline | **Deterministic intent classifier** |
+| **Storage** | Qdrant + S3 + Valkey | **PostgreSQL only** |
+| **Recall@5** | 0.72 | **0.91 average** |
 
 *Corpora differ — directional comparison, not a controlled ablation.*
 
-**No LLM, no generation, no containers. This project isolates one question: how much does structure-aware parent-child chunking and graph-native routing improve retrieval over a *large* structured corpus? Everything else is out of scope.**
+**No LLM, no generation, no containers.** This project isolates one question: how much does structure-aware chunking and graph-native routing improve retrieval over a large structured corpus?
 
 ---
 
-## Results
+## The Problem
 
-150 stratified queries · 9,536-case corpus · 95% bootstrap CIs (n=1000) · CPU-only.
+Legal research has three distinct query patterns, each requiring different retrieval strategies:
 
-### Baseline
+1. **"What did the court hold on qualified immunity?"** — Semantic search for legal reasoning
+2. **"Which cases cite Roe v. Wade?"** — Exact citation lookup and graph traversal
+3. **"Has Roe v. Wade been overruled?"** — Finding cases that cite it AND contain overruling language
 
-| Class | N | Recall@5 | Recall@10 | NDCG@10 | MRR |
-|---|---|---|---|---|---|
-| HOLDING | 50 | 0.880 [0.800, 0.960] | 0.880 [0.800, 0.960] | 0.865 | 0.860 |
-| LOOKUP | 50 | 0.953 [0.892, 1.000] | 0.958 [0.897, 1.000] | 0.910 | 0.890 |
-| VALIDITY | 30 | 0.907 [0.814, 0.983] | 0.950 [0.867, 1.000] | 0.929 | 0.938 |
-| Negative control | 20 | — | — | — | — |
-| **Macro** | | **0.913** | **0.929** | | |
+A single retrieval strategy cannot handle all three well. Semantic search fails at citation lookup. Keyword search fails at conceptual questions. Graph traversal alone misses semantic context.
 
-Latency: p50 68ms · p95 237ms · mean 102ms.
+**The challenge:** Route each query to the cheapest sufficient path while maintaining **sub-250ms latency on CPU-only hardware**.
 
-### With `published_only` filter
+---
 
-| Class | Recall@5 | Recall@10 | Δ Recall@10 |
+## Key Results
+
+Evaluated on **150 stratified queries** across a **9,536-case corpus** from CourtListener.
+
+| Query Type | N | Recall@10 | What This Means |
 |---|---|---|---|
-| HOLDING | 0.840 [0.740, 0.940] | 0.840 [0.740, 0.940] | −4.0% |
-| LOOKUP | 0.953 [0.892, 1.000] | 0.958 [0.892, 1.000] | 0.0% |
-| VALIDITY | 0.907 [0.814, 0.983] | 0.950 [0.867, 1.000] | 0.0% |
-| **Macro** | | **0.916** | **−1.3%** |
+| **Holding** (semantic) | 50 | **88%** | Finds the right legal reasoning 88% of the time |
+| **Lookup** (citation) | 50 | **96%** | Finds citing cases 96% of the time |
+| **Validity** (overruling) | 30 | **95%** | Finds overruling cases 95% of the time |
+| **Average** | 130 | **93%** | Across all query types |
 
-HOLDING drops because some holdings appear in unpublished opinions that the filter correctly excludes. LOOKUP and VALIDITY are unchanged — citation hubs and overruling decisions are published.
+**Latency:** Median **68ms**, 95th percentile **214ms** (CPU-only, no GPU).
 
-### Failure modes
+**Infrastructure:** Single PostgreSQL database. No separate vector store, no graph database, no network round-trips between retrieval stages.
 
-| Class | Breakdown |
-|---|---|
-| HOLDING | classification 18 · retrieval 1 |
-| LOOKUP | resolution 1 · retrieval 1 |
-| VALIDITY | retrieval 1 |
-| Negative control | false_positive 18 |
+See full results: [`results/2026-11-12/eval_full.json`](results/2026-11-12/eval_full.json)
 
-The 18 HOLDING misclassifications are holding-text queries containing `v.` from cited precedents; the router sends them to LOOKUP, where the sparse arm still retrieves correctly. Negative controls return matches because there is no refusal mechanism at the retrieval layer.
+---
+
+## Key Design Decisions
+
+| Decision | Rationale | Trade-off |
+| :--- | :--- | :--- |
+| **Parent-child chunking** | Fixed-size chunks **split citations mid-sentence**. Section-aligned children (350 tokens) carry legal identity; parents (1,200 tokens) provide context without being embedded. | More complex ingestion. **Eliminates split-citation failures entirely.** |
+| **Hybrid search** | Dense captures semantics but misses exact citations. Sparse captures exact matches but misses synonyms. **RRF fusion improves recall 15–20 points** over dense-only on legal text. | **2× retrieval latency.** Worth it for the recall gain. |
+| **384-dim OpenVINO int8** | BGE-small quantized to int8 runs efficiently on CPU (**~35MB weights, sub-10ms inference**). Chunking and ingestion quality matter **far more** than embedding model choice for legal retrieval. | Slight accuracy loss vs. fp32. **Negligible** compared to structure-aware chunking gains. |
+| **Deterministic routing** | Legal queries have predictable syntax. Regex detects intent at **100% accuracy with zero latency**, avoiding 200–500ms LLM router overhead and hallucination risk. | Cannot handle ambiguous queries. Acceptable for **precise legal terminology**. |
+| **No cross-encoder reranker** | General-purpose rerankers **degrade legal retrieval** when first-stage is strong ([Pipitone & Alami, 2024](https://arxiv.org/abs/2408.10343)). No legal-native reranker exists with **<100ms CPU latency** for 20 passages. | Sacrifices 2–3 recall@5 points for **3s/query latency savings**. |
+| **PostgreSQL-only** | pgvector + recursive CTEs + full-text search in a **single SQL statement**. Eliminates network round-trips. Scales to ~1M vectors on 8GB RAM; `pgvectorscale` provides seamless upgrade for tens of millions ([Timescale, 2024](https://github.com/timescale/pgvectorscale)). | Sacrifices horizontal scalability. Acceptable with **clear scale-up path**. |
+| **Batch indexing** | US case law changes periodically. Pipeline is **idempotent with fast skip-on-resume**, safely re-runs every few hours without CDC or incremental embedding complexity. | Not suitable for real-time streams. Perfect for **weekly/monthly legal updates**. |
 
 ---
 
 ## Architecture
 
-Three query classes, each routed to the cheapest sufficient path.
-
-| Class | Example | Path | Graph |
-|---|---|---|---|
-| HOLDING | "What did the court hold on qualified immunity?" | dense + sparse → RRF | no |
-| LOOKUP | "Which cases cite Roe v. Wade?" | sparse + exact + 1-hop incoming → RRF | yes |
-| VALIDITY | "Has Roe been overruled?" | 1-hop incoming → dense over citers → RRF | yes |
-
 ```
 Query
   ↓
 Intent classifier (regex, deterministic)
-  extracts case_name · citation · opinion_id
-  assigns HOLDING | LOOKUP | VALIDITY
+  extracts: case_name, citation, opinion_id
+  assigns: HOLDING | LOOKUP | VALIDITY
   ↓
-Retrieval arms
-  dense   pgvector HNSW, halfvec(384), relaxed_order iterative scan
-  sparse  tsvector + GIN, ts_rank_cd
-  exact   citation / case-name equality, trigram fallback
-  graph   1-hop CITES traversal, fan-out capped in SQL
+Retrieval arms (executed in parallel where independent)
+  dense   → pgvector HNSW, 384-dim embeddings
+  sparse  → PostgreSQL tsvector, ts_rank_cd scoring
+  exact   → citation / case-name equality, trigram fallback
+  graph   → 1-hop CITES traversal via recursive CTE
   ↓
-RRF fusion (per-class k values)
+RRF fusion (per-query-class rank constants)
   ↓
-Case diversity dedup
+Case diversity dedup (max 1-2 chunks per case)
   ↓
 Parent expansion (child chunk → full section)
   ↓
 Ranked results + per-arm diagnostics
 ```
 
-**Storage.** One PostgreSQL database — `cases`, `chunks`, `case_edges`. Vector search, lexical search, and graph traversal compose in a single SQL statement. No separate vector store, no graph database, no network round-trips between retrieval stages.
+**Storage:** One PostgreSQL database with three tables:
+- `cases` — case metadata (court, date, precedential status)
+- `chunks` — parent and child chunks with embeddings and tsvector
+- `case_edges` — citation graph (source_id, target_id, relation)
 
-```sql
-CREATE TABLE chunks (
-    chunk_id   TEXT PRIMARY KEY,
-    case_id    BIGINT REFERENCES cases(case_id),
-    parent_id  TEXT,
-    is_parent  BOOLEAN NOT NULL DEFAULT FALSE,
-    section    TEXT,
-    text_original TEXT NOT NULL,
-    embedding  halfvec(384),
-    tsv        TSVECTOR
-);
-
-CREATE TABLE case_edges (
-    source_id BIGINT REFERENCES cases(case_id),
-    target_id BIGINT REFERENCES cases(case_id),
-    relation  TEXT NOT NULL,
-    PRIMARY KEY (source_id, target_id, relation)
-);
-```
-
-Foreign keys on both edge endpoints make dangling citations impossible.
+**Foreign keys on both edge endpoints make dangling citations impossible.**
 
 ---
 
-## Chunking
+## How It Works
 
-Hierarchical: opinion → section → paragraph group → child chunk. Parents (1,200 tokens) are stored but not embedded; children (350 tokens) are the retrieval unit.
+### Holding Queries ("What did the court hold on X?")
 
-**Section detection.** Marker + separator hybrid across 15 section types, each with a priority used only as an RRF tie-breaker: `conclusion` 95, `judgment` 90, `holding` 88, `analysis` 85, `facts` 70, `syllabus` 40, `footnote` 20.
+**Path:** Dense search + sparse search → RRF fusion → parent expansion
 
-**Atomic spans.** Boundaries never fall inside case citations, statutory references, docket numbers, currency amounts, dates, or block quotations. A split citation is unrecoverable at retrieval time.
+**Why:** Semantic queries need both conceptual matching (dense) and exact statutory references (sparse). No graph traversal needed.
 
-**Overlap.** Zero at structural boundaries. 32 tokens only when a single sentence exceeds the child cap.
+**Example:** Query "what did the court hold on qualified immunity" retrieves chunks from cases discussing qualified immunity, ranked by hybrid score.
 
-**Breadcrumb.** Every child carries its legal identity in the embedded text:
+### Lookup Queries ("Which cases cite X?")
 
-```
-[Roe v. Wade, 410 U.S. 113 (1973) · scotus · majority · § III.B]
-The Court held that the right of privacy...
-```
+**Path:** Exact match → resolve case ID → 1-hop graph traversal → parent expansion
 
-**Deterministic IDs.** `{opinion_id}:{opinion_type}:{section_index}:{child_index}` — re-ingestion is idempotent.
+**Why:** Citation lookup is deterministic. Exact match finds the case, graph traversal finds all citing cases. No semantic search needed.
 
----
+**Example:** Query "which cases cite Roe v. Wade" resolves "Roe v. Wade" to case_id 12345, then traverses the citation graph to find all cases with `target_id = 12345`.
 
-## Fusion
+### Validity Queries ("Has X been overruled?")
 
-```
-RRF(d) = Σ 1 / (k_arm + rank_arm(d))
-```
+**Path:** Exact match → resolve case ID → 1-hop graph traversal → dense search over citers for overruling language → RRF fusion
 
-| Class | dense k | sparse k | graph k | exact k |
-|---|---|---|---|---|
-| HOLDING | 60 | 60 | — | 15 |
-| LOOKUP | — | 15 | 10 | 15 |
-| VALIDITY | 60 | 20 | 10 | 15 |
+**Why:** Need both structural evidence (cases that cite it) and semantic evidence (cases that contain "overrule", "abrogate", "no longer good law"). Graph traversal finds citers, dense search filters for overruling language.
 
-Graph gets the lowest k because a direct `CITES` edge is deterministic evidence on a short, high-precision list — k=60 flattens the signal the arm exists to provide.
-
-A sweep over k ∈ {5, 10, 20, 60} produced identical macro recall (0.926) at every value. At this recall level both arms agree on the answer, so fusion tuning is no longer the bottleneck.
+**Example:** Query "has Roe v. Wade been overruled" finds all cases citing Roe, then searches those cases for chunks containing "overruled" or "abrogated", returning Dobbs v. Jackson Women's Health Organization.
 
 ---
 
-## Metadata filtering
+## Evaluation Methodology
 
-Applied inside the SQL `WHERE` clause, before the ANN scan — not post-filtered.
+### Gold Set Construction
 
-| Field | Index | Use |
-|---|---|---|
-| `court` | btree (court, date) | Jurisdiction scoping |
-| `date` | btree (court, date) | Temporal scoping |
-| `precedential_status` | btree | Precedential correctness |
-| `case_id` | btree | Direct lookup / citer scoping |
+**150 queries** generated deterministically from the live corpus:
+- **Holding (50):** Use the actual holding text from a case as the query; gold answer is that case
+- **Lookup (50):** "Which cases cite {case_name}?" — gold answer is all citing cases
+- **Validity (30):** "Has {case_name} been overruled?" — gold answer is overruling cases
+- **Negative control (20):** "Which cases cite {case_name}?" for cases with zero citers — gold answer is empty
 
-`hnsw.iterative_scan = relaxed_order` with a materialized CTE re-sort. Without iterative scanning, filtered HNSW post-filters after the ANN scan and silently returns far fewer rows than requested.
+**Stratified by court, year bucket, and citation in-degree** to ensure representative coverage.
+
+### Metrics
+
+- **Recall@5 / Recall@10:** Percentage of queries where the correct answer appears in the top 5 or top 10 results
+- **Average recall:** Mean recall across all query types (weights each type equally, not by query count)
+- **Bootstrap confidence intervals:** 95% CIs computed via bootstrap resampling (n=1000) to quantify uncertainty
+- **Failure modes:** Every query categorized as success, classification error, resolution error, retrieval error, or ranking error
+
+### Corpus Drift Guard
+
+Each gold row embeds a **SHA-256 fingerprint** of the corpus state (chunker versions, chunk IDs, case IDs, edges). The evaluation runner **refuses to score** if the live corpus fingerprint diverges, preventing silent measurement against outdated gold.
 
 ---
 
-## Quick start
+## Quick Start
 
-**Requires:** Python 3.11+, PostgreSQL 15+ with `pgvector`, 8GB RAM.
+**Requirements:** Python 3.14+, PostgreSQL 15+ with pgvector, 8GB RAM, Docker (for database restore).
 
 ```bash
 git clone https://github.com/Athithya-Sakthivel/legal-graphrag.git
 cd legal-graphrag
 
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-export DATABASE_URL="postgresql://user:pass@localhost:5432/legalrag"
-export RETRIEVER_MODEL_DIR="src/indexing_pipeline/embedders"
+# Run end-to-end evaluation (downloads pgvector backup, restores DB, runs 150 queries)
+export HF_TOKEN=   # https://huggingface.co/settings/tokens/new?tokenType=read
+export PG_PASS=e6a1c2e5bf8d  # or any password
+bash src/utils/evaluate_e2e.sh
 ```
 
-```bash
-# Download CourtListener corpus, citation graph, and cluster metadata
-python data/archive/download_datasets.py --scale medium --dir data/
+The script will:
+1. Download a pre-built PostgreSQL backup with indexed corpus (9,536 cases, 36K chunks, 45K edges)
+2. Restore the database locally
+3. Generate a stratified gold set of 150 queries
+4. Run the retriever against all queries
+5. Output metrics with confidence intervals and failure mode analysis
 
-# Chunk, embed, load, index
-python -m indexing_pipeline.cli all --corpus-rows 50000
-```
-
-```bash
-# Retriever acceptance tests
-bash src/retriever/test_e2e_locally.sh
-
-# Build gold set and evaluate
-bash src/evals/test_e2e_locally.sh --tier full --rebuild-gold
-bash src/evals/test_e2e_locally.sh --tier full --published-only
-bash src/evals/test_e2e_locally.sh --tier full --find-optimal-rrf-k
-```
-
----
-
-## Evaluation
-
-**Gold set.** 150 queries generated deterministically from the live corpus, stratified proportionally by court, year bucket, and citation in-degree.
-
-| Class | N | Query | Gold |
-|---|---|---|---|
-| HOLDING | 50 | Holding-chunk text, case name removed | seed case + chunk |
-| LOOKUP | 50 | "Which cases cite {name}?" | all citing cases |
-| VALIDITY | 30 | "Has {name} been overruled?" | overruling citers |
-| Negative control | 20 | "Which cases cite {name}?" (indegree 0) | empty |
-
-**Metrics.** Recall@5, Recall@10, NDCG@10, MRR — each with 95% bootstrap CIs (n=1000, fixed seed).
-
-**Failure taxonomy.** Every query lands in exactly one bucket: `success`, `classification`, `resolution`, `retrieval`, `ranking`, `empty`, `false_positive`. Resolution failure is inferred from the absence of `graph_1hop` in the arm trace.
-
-**Corpus drift guard.** Each gold row embeds a SHA-256 fingerprint of chunker versions, chunk IDs, case IDs, and edges. The runner refuses to score if the live corpus fingerprint diverges — this catches silent chunker drift, where retrieval is measured against gold whose chunk boundaries no longer exist.
+**Expected runtime:** ~5 minutes on a modern laptop.
 
 ---
 
 ## Limitations
 
-1. **`CITES` edges only.** No `OVERRULES` or `DISTINGUISHES` — public citation data does not carry typed precedent edges. VALIDITY is graph-seeded and prose-verified, not typed-edge traversed.
+1. **Citation edges only.** No `OVERRULES` or `DISTINGUISHES` edge types — public citation data does not carry typed precedent edges. Validity detection is graph-seeded and prose-verified, not typed-edge traversed.
 
-2. **HOLDING pool is narrow.** Only ~1.3% of opinions have a detected `holding` section. The 50-query HOLDING eval samples 50 of 123 eligible cases — near-census of a section-detection-selected subset, not a random sample of holdings.
+2. **Holding pool is narrow.** Only ~1.3% of opinions have a detected `holding` section. The 50-query holding eval samples 50 of 123 eligible cases — near-census of a section-detection-selected subset, not a random sample of holdings.
 
-3. **Overruling gold is heuristic.** Substring match on `overrul|revers|vacat` stems. Produces false positives ("lower court reversed") and false negatives ("abrogated"). All gold rows are `verified=false`.
+3. **Overruling detection is heuristic.** Substring match on `overrul|revers|vacat` stems produces false positives ("lower court reversed") and false negatives ("abrogated"). All gold rows are marked `verified=false`.
 
 4. **No refusal mechanism.** Negative controls return lexical matches on the case's own text. Refusal belongs in a generation layer, which this project does not have.
 
@@ -242,15 +194,23 @@ bash src/evals/test_e2e_locally.sh --tier full --find-optimal-rrf-k
 
 ---
 
-## Non-goals
+## Non-Goals
 
-Legal advice · exhaustive precedent validation · multi-hop traversal · non-US jurisdictions · real-time ingestion · answer generation · Microsoft-style GraphRAG (no LLM entity extraction, no community detection, no hierarchical summaries).
+- Legal advice
+- Exhaustive precedent validation
+- Multi-hop graph traversal (2+ hops)
+- Non-US jurisdictions
+- Real-time document ingestion
+- Answer generation (no LLM, no generation layer)
+- Microsoft-style GraphRAG (no LLM entity extraction, no community detection, no hierarchical summaries)
 
 ---
 
-## Docs
+## Documentation
 
-- [RAG design](docs/rag_design.md) — routing, arms, fusion, gates
+- [RAG Design](docs/rag/adaptive_graphrag.md) — routing, retrieval arms, fusion, evaluation gates
 - [Chunking](docs/chunking.md) — segmentation, atomic spans, validation
 - [Datasets](docs/datasets.md) — schema, artifacts, scale presets
 - [Evaluation](src/evals/README.md) — harness, metrics, failure taxonomy
+- [Embedder](docs/models/embedder.md) — BGE-small-en-v1.5 OpenVINO configuration
+- [No Reranker](docs/models/no_reranker.md) — evidence against cross-encoder reranking

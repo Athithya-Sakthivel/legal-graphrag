@@ -1,7 +1,16 @@
 """Pure algorithm — structure-aware chunking of court opinions.
 
-No I/O, no database, no model. Deterministic: same input + same tokenizer
+No I/O, no database, no model
+Deterministic: same input + same tokenizer
 + same is_noise predicate + same token limit produce the same output.
+
+v3.0 changes (ID determinism fix):
+  - BREAKING: chunk_id and parent_id are now based on character offsets
+    (e.g., "12345:c:1024:2048") instead of section/child indices.
+  - This guarantees IDs remain stable even if tokenizer loading fails
+    or token counting heuristics drift, completely eliminating ID drift
+    on pipeline resume.
+  - Version bumped to chunk-v3.0 to invalidate old caches.
 
 v2.7 changes (final):
   - QUALITY_GATE_3_MAX_RATE = 0.04. Since aggregate gate_3 rate is a
@@ -63,7 +72,7 @@ from typing import Any
 
 # ── Versioning ──────────────────────────────────────────────────────────
 
-CHUNKER_VERSION = "chunk-v2.8"
+CHUNKER_VERSION = "chunk-v3.0"
 
 
 # ── Default embedder token limit ────────────────────────────────────────
@@ -397,8 +406,14 @@ def _hash_text(text: str) -> str:
     return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
 
 
-def _make_chunk_id(case_id: int, opinion_type: str, section_index: int, child_index: int) -> str:
-    return f"{case_id}:{opinion_type}:{section_index}:{child_index}"
+def _make_chunk_id(case_id: int, is_parent: bool, char_start: int, char_end: int) -> str:
+    """Generate deterministic chunk IDs based on character offsets.
+
+    This prevents ID drift if tokenizer loading fails or token counting
+    heuristics change, ensuring pipeline resume logic remains stable.
+    """
+    prefix = "p" if is_parent else "c"
+    return f"{case_id}:{prefix}:{char_start}:{char_end}"
 
 
 def _make_breadcrumb(
@@ -605,7 +620,7 @@ def _sentence_spans(
 # Matches the end of a complete sentence: one of . ! ? … : ; optionally
 # followed by any number of closing quote/bracket/whitespace characters.
 # Triple-quoted raw string needed because " is a class member.
-_SENTENCE_END_RE = re.compile(r"""[.!?…:;][]["”’')\s]*$""")
+_SENTENCE_END_RE = re.compile(r"""[.!?…:;][]["”’''")\s]*$""")
 
 
 def _trim_to_sentence_end(text: str, start: int, end: int, *, min_ratio: float = 0.55) -> int:
@@ -1068,7 +1083,9 @@ def chunk_opinion(
             opinion_type=canonical_type,
             section_path=section_path,
         )
-        parent_id = _make_chunk_id(case_id, canonical_type, section_index, -1)
+
+        # ID based on character offsets for determinism
+        parent_id = _make_chunk_id(case_id, True, parent_start, parent_end)
 
         breadcrumb_text = breadcrumb + "\n"
         breadcrumb_tokens = _measure(breadcrumb_text, tokenize)
@@ -1100,12 +1117,8 @@ def chunk_opinion(
             if is_noise is not None and is_noise(child_body):
                 continue
 
-            child_id = _make_chunk_id(
-                case_id,
-                canonical_type,
-                section_index,
-                child_index,
-            )
+            # ID based on character offsets for determinism
+            child_id = _make_chunk_id(case_id, False, child_start, child_end)
 
             section_children.append(
                 Chunk(

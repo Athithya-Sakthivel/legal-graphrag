@@ -1,4 +1,13 @@
-"""Load-side stages — embed, load, validate, index, drop_indexes."""
+"""Load-side stages — embed, load, validate, index, drop_indexes.
+
+Manifest Bloat Removed (v1.6):
+  - This module no longer relies on `embedded/_manifest.jsonl` or
+    `chunked/_manifest.jsonl` for skip logic or state tracking.
+  - The filesystem is the single source of truth. Skip logic verifies
+    file existence and content hashes/line counts directly on disk.
+  - This eliminates state-synchronization bugs where a pipeline crash
+    leaves manifests and files out of sync.
+"""
 
 from __future__ import annotations
 
@@ -22,13 +31,14 @@ from .io_utils import (
     atomic_write_jsonl,
     json_safe,
     read_jsonl,
-    sha256_file,
     utc_now,
+    write_jsonl_from_dict,
 )
 from .pipeline_helpers import (
     EMBED_CASES_PER_BATCH,
     PIPELINE_STATE_KEY,
     PipelineError,
+    PlanEntry,
     StageReport,
 )
 
@@ -37,6 +47,12 @@ logger = logging.getLogger("indexing_pipeline")
 
 class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
     """Stages from embedding onward: embed, load, validate, index, drop-index."""
+
+    def _persist_embed_failures(self, failures: dict[int, dict]) -> None:
+        write_jsonl_from_dict(
+            self.config.embedded_dir / "_failures.jsonl",
+            failures,
+        )
 
     def embed(self) -> StageReport:
         self._require_open()
@@ -48,23 +64,20 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             if self.config.force:
                 self._clear_halted("embed")
 
-            chunk_manifest = self._load_manifest(self.config.chunked_dir)
-            if not chunk_manifest:
-                raise PipelineError("embed", "chunked manifest is empty")
+            # We iterate over the plan to know exactly which cases to process
+            plan = self._load_plan()
+            if not plan:
+                raise PipelineError("embed", "plan is empty or missing")
 
             if self.config.dry_run:
-                logger.info(
-                    "embed dry-run: %d cases, device=%s", len(chunk_manifest), self.config.device
-                )
-                return StageReport("embed", 0, len(chunk_manifest), 0, time.monotonic() - started)
+                logger.info("embed dry-run: %d cases", len(plan))
+                return StageReport("embed", 0, len(plan), 0, time.monotonic() - started)
 
             self.config.embedded_dir.mkdir(parents=True, exist_ok=True)
-            previous = self._load_manifest(self.config.embedded_dir)
             failures = self._get_failures(self.config.embedded_dir)
 
-            new_manifest: dict[int, dict] = {}
             processed = skipped = failed = 0
-            case_ids = sorted(chunk_manifest)
+            case_ids = sorted(plan.keys())
 
             logger.info("embed starting: %d cases, device=%s", len(case_ids), self.config.device)
             embedder = self._get_embedder()
@@ -73,27 +86,43 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             for batch_start in range(0, len(case_ids), EMBED_CASES_PER_BATCH):
                 case_batch = case_ids[batch_start : batch_start + EMBED_CASES_PER_BATCH]
 
-                pending: list[tuple[int, dict, list[dict]]] = []
+                pending: list[tuple[int, PlanEntry, list[dict]]] = []
                 for case_id in case_batch:
-                    chunk_entry = chunk_manifest[case_id]
-                    if not self.config.force and self._is_valid_embed_output(
-                        case_id, chunk_entry, previous.get(case_id)
-                    ):
-                        new_manifest[case_id] = previous[case_id]
+                    plan_entry = plan[case_id]
+
+                    # Check if chunk output is valid on disk
+                    if not self._is_valid_chunk_output(case_id, plan_entry):
+                        failed += 1
+                        processed += 1
+                        failures[case_id] = {
+                            "case_id": case_id,
+                            "error": "chunk output missing or invalid",
+                            "traceback": "",
+                            "stage": "embed",
+                            "ts": utc_now(),
+                        }
+                        continue
+
+                    # Check if embed output is already valid on disk
+                    if not self.config.force and self._is_valid_embed_output(case_id):
                         skipped += 1
+                        processed += 1
                         continue
 
                     try:
                         chunk_path = self._chunked_file(case_id)
-                        if not chunk_path.is_file():
-                            raise FileNotFoundError(chunk_path)
-                        if sha256_file(chunk_path) != chunk_entry["file_sha256"]:
-                            raise PipelineError("embed", f"chunk hash mismatch {case_id}")
                         rows = list(read_jsonl(chunk_path))
                         children = [r for r in rows if not bool(r["is_parent"])]
-                        if len(children) != int(chunk_entry["embedding_count"]):
-                            raise PipelineError("embed", f"child count mismatch {case_id}")
-                        pending.append((case_id, chunk_entry, children))
+
+                        if not children:
+                            # No children to embed (e.g., all dropped by noise filter).
+                            # Write an empty file to mark it as processed.
+                            atomic_write_jsonl(self._embedded_file(case_id), [])
+                            skipped += 1
+                            processed += 1
+                            continue
+
+                        pending.append((case_id, plan_entry, children))
                     except Exception as exc:
                         failed += 1
                         processed += 1
@@ -106,7 +135,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                         }
 
                 if not pending:
-                    if processed and processed % 10 == 0:
+                    if processed % 10 == 0:
                         logger.info(
                             "embed progress: %d/%d, skipped=%d, failed=%d",
                             processed,
@@ -136,7 +165,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     logger.warning("batch embed failed (%s); retrying per-case", type(exc).__name__)
 
                 if batch_ok and all_vecs is not None:
-                    for (case_id, chunk_entry, children), (slice_start, slice_end) in zip(
+                    for (case_id, _plan_entry, children), (slice_start, slice_end) in zip(
                         pending, slices, strict=True
                     ):
                         try:
@@ -147,15 +176,6 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                             ]
                             out_path = self._embedded_file(case_id)
                             atomic_write_jsonl(out_path, output_rows)
-                            new_manifest[case_id] = {
-                                "case_id": case_id,
-                                "chunk_count": len(output_rows),
-                                "model_version": self.config.embedder_version,
-                                "device": self.config.device,
-                                "chunked_file_sha256": chunk_entry["file_sha256"],
-                                "file_sha256": sha256_file(out_path),
-                                "completed_at": utc_now(),
-                            }
                             failures.pop(case_id, None)
                         except Exception as exc:
                             failed += 1
@@ -168,7 +188,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                             }
                         processed += 1
                 else:
-                    for case_id, chunk_entry, children in pending:
+                    for case_id, _plan_entry, children in pending:
                         try:
                             per_vecs = embedder.embed_documents([str(r["text"]) for r in children])
                             output_rows = [
@@ -177,15 +197,6 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                             ]
                             out_path = self._embedded_file(case_id)
                             atomic_write_jsonl(out_path, output_rows)
-                            new_manifest[case_id] = {
-                                "case_id": case_id,
-                                "chunk_count": len(output_rows),
-                                "model_version": self.config.embedder_version,
-                                "device": self.config.device,
-                                "chunked_file_sha256": chunk_entry["file_sha256"],
-                                "file_sha256": sha256_file(out_path),
-                                "completed_at": utc_now(),
-                            }
                             failures.pop(case_id, None)
                         except Exception as case_exc:
                             failed += 1
@@ -205,7 +216,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     skipped,
                     failed,
                 )
-                self._persist_embed_state(new_manifest, failures)
+                self._persist_embed_failures(failures)
 
                 if self._check_failure_threshold(failed, processed):
                     reason = f"failure threshold exceeded: {failed}/{processed}"
@@ -218,7 +229,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                         ),
                     )
 
-            self._persist_embed_state(new_manifest, failures)
+            self._persist_embed_failures(failures)
 
             if self._check_failure_threshold(failed, processed):
                 reason = f"failure threshold exceeded: {failed}/{processed}"
@@ -231,16 +242,11 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     ),
                 )
 
-            orphans = self._cleanup_orphans(self.config.embedded_dir, set(new_manifest.keys()))
-            if orphans:
-                logger.info("embed cleaned %d orphan files", orphans)
-
             logger.info(
-                "embed complete: %d processed, %d skipped, %d failed, %d orphans (device=%s)",
+                "embed complete: %d processed, %d skipped, %d failed (device=%s)",
                 processed,
                 skipped,
                 failed,
-                orphans,
                 self.config.device,
             )
             return StageReport("embed", processed, skipped, failed, time.monotonic() - started)
@@ -332,34 +338,31 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             started = time.monotonic()
             self._check_inputs(include_metadata=True)
 
-            chunk_manifest = self._load_manifest(self.config.chunked_dir)
-            embed_manifest = self._load_manifest(self.config.embedded_dir)
-
-            if not chunk_manifest:
-                raise PipelineError("load", "chunked manifest is empty (all cases dropped?)")
-            if set(chunk_manifest) != set(embed_manifest):
-                raise PipelineError("load", "chunked and embedded case IDs differ")
-
-            if any(read_jsonl(self.config.chunked_dir / "_failures.jsonl")):
-                raise PipelineError("load", "precondition: unresolved chunking failures")
-            if any(read_jsonl(self.config.embedded_dir / "_failures.jsonl")):
-                raise PipelineError("load", "precondition: unresolved embedding failures")
-
-            for case_id, chunk_entry in chunk_manifest.items():
-                chunk_path = self._chunked_file(case_id)
-                if not chunk_path.is_file():
-                    raise PipelineError("load", f"missing chunk file for {case_id}")
-                if chunk_entry.get("file_sha256") != sha256_file(chunk_path):
-                    raise PipelineError("load", f"chunk file hash mismatch for {case_id}")
-                if not self._is_valid_embed_output(case_id, chunk_entry, embed_manifest[case_id]):
-                    raise PipelineError(
-                        "load",
-                        f"invalid embed output for {case_id} (re-run `embed` after chunk/dedup changes)",
-                    )
+            plan = self._load_plan()
+            if not plan:
+                raise PipelineError("load", "plan is empty or missing")
 
             if self.config.dry_run:
-                logger.info("load dry-run: %d cases", len(chunk_manifest))
-                return StageReport("load", 0, len(chunk_manifest), 0, time.monotonic() - started)
+                logger.info("load dry-run: %d cases", len(plan))
+                return StageReport("load", 0, len(plan), 0, time.monotonic() - started)
+
+            # Check for unresolved failures in previous stages
+            chunk_failures = self._get_failures(self.config.chunked_dir)
+            if chunk_failures:
+                raise PipelineError("load", "precondition: unresolved chunking failures")
+
+            embed_failures = self._get_failures(self.config.embedded_dir)
+            if embed_failures:
+                raise PipelineError("load", "precondition: unresolved embedding failures")
+
+            # Verify all planned cases have valid chunk and embed outputs on disk
+            valid_case_ids = []
+            for case_id, plan_entry in plan.items():
+                if not self._is_valid_chunk_output(case_id, plan_entry):
+                    raise PipelineError("load", f"missing or invalid chunk output for {case_id}")
+                if not self._is_valid_embed_output(case_id):
+                    raise PipelineError("load", f"missing or invalid embed output for {case_id}")
+                valid_case_ids.append(case_id)
 
             database = self._get_database()
             database.ensure_schema()
@@ -375,14 +378,10 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             ):
                 if database.index_exists() and database.index_is_valid():
                     logger.info("load skipped: unchanged dataset, index valid")
-                    return StageReport(
-                        "load", 0, len(chunk_manifest), 0, time.monotonic() - started
-                    )
+                    return StageReport("load", 0, len(plan), 0, time.monotonic() - started)
                 if not database.index_exists():
                     logger.info("load skipped: unchanged dataset, index absent")
-                    return StageReport(
-                        "load", 0, len(chunk_manifest), 0, time.monotonic() - started
-                    )
+                    return StageReport("load", 0, len(plan), 0, time.monotonic() - started)
 
             if database.index_exists():
                 raise PipelineError(
@@ -390,11 +389,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     "precondition: index exists; run 'drop-index' then 'load' or 'all --force'",
                 )
 
-            plan = self._load_plan()
-            if not plan:
-                raise PipelineError("load", "precondition: plan is empty or missing")
-
-            loaded_ids = set(chunk_manifest.keys())
+            loaded_ids = set(valid_case_ids)
             dropped_count = len(plan) - len(loaded_ids)
             if dropped_count > 0:
                 logger.info(
@@ -417,13 +412,12 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
                     yield self._join_cases(record, cluster)
 
             case_count = database.load_cases(case_rows())
-            loaded_ids_set = loaded_ids
 
             def edge_rows() -> Iterator[dict]:
                 for row in self._iter_parquet(self.config.edges_file):
                     source = int(row["citing_opinion_id"])
                     target = int(row["cited_opinion_id"])
-                    if source not in loaded_ids_set or target not in loaded_ids_set:
+                    if source not in loaded_ids or target not in loaded_ids:
                         continue
                     yield {
                         "source_id": source,
@@ -435,7 +429,7 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             database.load_edges(edge_rows())
 
             def chunk_rows() -> Iterator[dict]:
-                for case_id in sorted(chunk_manifest):
+                for case_id in sorted(valid_case_ids):
                     yield from self._merge_chunks_and_vectors(case_id)
 
             staged = database.stage_chunks(chunk_rows())
@@ -479,8 +473,8 @@ class LoadMixin(IndexingPipelineBase):  # type: ignore[misc]
             return StageReport("load", staged, 0, 0, time.monotonic() - started)
 
     def _determinism_check(self, sample_size: int = 20) -> db.GateResult:
-        chunk_manifest = self._load_manifest(self.config.chunked_dir)
-        candidates = sorted(chunk_manifest)[:sample_size]
+        plan = self._load_plan()
+        candidates = sorted(plan.keys())[:sample_size]
         if not candidates:
             return db.GateResult(
                 name="gate_8_determinism",

@@ -3,27 +3,11 @@
 Lower layer of the pipeline module. Imported by pipeline.py.
 Does not import from pipeline.py — no circular dependency.
 
-Sync notes (v1.5):
-  - Paths CLUSTERS_REL and EDGES_REL now include the `raw/` prefix.
-    Previously they resolved to `tmp/data/metadata/...` and
-    `tmp/data/graph/...` instead of `tmp/data/raw/...`, which broke
-    `cli all` at the `load` stage with FileNotFoundError. All three
-    dataset files now resolve under `<data_dir>/raw/`, matching
-    data/README.md's tree.
-  - Config gains dedup_version and filters_version properties so that
-    pipeline._dataset_fingerprint() can include them. Any change to
-    filters.py or dedup.py invalidates pipeline_state and forces
-    `load` to re-run.
-  - Config gains dedup_enabled, noise_filter_enabled, and
-    strict_worker_tokenizer flags. All default True.
-  - worker_init accepts noise_filter and strict_tokenizer. Strict mode
-    raises if no tokenizer can be loaded, instead of silently falling
-    back to the chars/CHARS_PER_TOKEN heuristic — which underestimates
-    tokens on ~5% of documents and can produce oversize chunks that the
-    embedder rejects.
-  - chunk_worker accepts an is_noise parameter and forwards it to
-    chunker.chunk_opinion. Multi-process workers receive it via the
-    module-global _WORKER_IS_NOISE, set by worker_init.
+Sync notes (v1.6 - ID Drift Fix):
+  - REMOVED `strict_worker_tokenizer` config flag and the `chars / CHARS_PER_TOKEN`
+    fallback logic. If the tokenizer fails to load, the pipeline now crashes
+    immediately. This prevents silent boundary shifts that cause chunk ID
+    drift on pipeline resume.
 """
 
 from __future__ import annotations
@@ -158,10 +142,9 @@ class Config:
     dry_run: bool = False
     force: bool = False
 
-    # v1.5 sync: behavior toggles. All default True (safe defaults).
+    # Behavior toggles. All default True (safe defaults).
     dedup_enabled: bool = True
     noise_filter_enabled: bool = True
-    strict_worker_tokenizer: bool = True
 
     # ── Path properties ─────────────────────────────────────────────
 
@@ -243,7 +226,6 @@ class Config:
         for name in (
             "dedup_enabled",
             "noise_filter_enabled",
-            "strict_worker_tokenizer",
         ):
             value = getattr(self, name)
             if not isinstance(value, bool):
@@ -256,9 +238,6 @@ class Config:
         # DATABASE_URL is optional. Stages that need Postgres (load, validate,
         # index, drop-index) raise a clear PipelineError when db_dsn is empty.
         # The embed stage never opens a database connection, so it runs without.
-        #
-        # v1.5: dedup_enabled, noise_filter_enabled, and strict_worker_tokenizer
-        # are CLI-only. No env vars; defaults are safe.
         dsn = os.environ.get("DATABASE_URL", "").strip()
         return cls(
             data_dir=DEFAULT_DATA_DIR,
@@ -288,7 +267,6 @@ class Config:
             "force",
             "dedup_enabled",
             "noise_filter_enabled",
-            "strict_worker_tokenizer",
         }
         unknown = set(kwargs) - allowed
         if unknown:
@@ -331,7 +309,6 @@ def worker_init(
     model_dir_str: str,
     gpu_model_dir_str: str = "",
     noise_filter: bool = True,
-    strict_tokenizer: bool = True,
 ) -> None:
     """Load per-worker state: tokenizer and optional noise predicate.
 
@@ -339,19 +316,9 @@ def worker_init(
     (base HF checkpoint). On Kaggle only the GPU directory exists: model_dir
     is the OpenVINO IR path, which is not downloaded there.
 
-    Args:
-        model_dir_str:      CPU model directory (contains tokenizer.json)
-        gpu_model_dir_str:  GPU model directory (fallback)
-        noise_filter:       if True, set _WORKER_IS_NOISE to
-                            filters.is_noise_chunk. If False, leave it None.
-        strict_tokenizer:   if True and no tokenizer can be loaded, raise
-                            RuntimeError instead of falling back to the
-                            chars/CHARS_PER_TOKEN heuristic. The heuristic
-                            underestimates tokens on ~5% of documents
-                            (measured: p05 chars/token = 2.25, min = 2.0)
-                            and can produce oversize chunks that the embed
-                            stage rejects. Default True — fail loud, not
-                            silently.
+    Raises RuntimeError if no tokenizer can be loaded. We do not fall back
+    to character-based heuristics, as that causes ID drift and boundary
+    shifts on pipeline resume.
     """
     global _WORKER_TOKENIZE, _WORKER_IS_NOISE
 
@@ -371,24 +338,12 @@ def worker_init(
         except Exception:
             continue
 
-    if strict_tokenizer:
-        raise RuntimeError(
-            f"worker_init: no tokenizer found in any of {candidates}. "
-            f"Chunking without a real tokenizer falls back to "
-            f"chars/{chunker.CHARS_PER_TOKEN:.2f} estimation, which is "
-            f"unsafe for dense legal text (can produce oversize chunks "
-            f"that the embed stage will reject). Set "
-            f"strict_tokenizer=False to allow the fallback with the "
-            f"known risk."
-        )
-
-    logger.error(
-        "worker failed to load tokenizer from any of %s; falling back to "
-        "chars/%.2f heuristic (strict_tokenizer=False)",
-        candidates,
-        chunker.CHARS_PER_TOKEN,
+    raise RuntimeError(
+        f"worker_init: no tokenizer found in any of {candidates}. "
+        f"Chunking without a real tokenizer is forbidden because it causes "
+        f"ID drift and boundary shifts on pipeline resume. Ensure the "
+        f"tokenizer is downloaded and accessible."
     )
-    _WORKER_TOKENIZE = None
 
 
 def chunk_worker(
@@ -402,8 +357,8 @@ def chunk_worker(
         record:    opinion dict (must include cl_opinion_id, text, text_kind)
         tokenize:  optional int-returning tokenizer. When None, falls back
                    to _WORKER_TOKENIZE (set by worker_init in the process
-                   pool path). When both are None, chunker uses its
-                   chars/CHARS_PER_TOKEN heuristic.
+                   pool path). If both are None, chunker will raise an error
+                   (fallback heuristic removed to prevent ID drift).
         is_noise:  optional `text -> bool` predicate. When None, falls back
                    to _WORKER_IS_NOISE (set by worker_init based on
                    config.noise_filter_enabled). When both are None, no

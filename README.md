@@ -1,12 +1,14 @@
 # Legal GraphRAG
 
-**Citation-aware retrieval over US case law** — built to close the 0.72 recall@5 ceiling from [RAG8s](https://github.com/Athithya-Sakthivel/RAG8s) via structure-aware chunking and native citation-graph traversal.
+**Citation-aware retrieval over US case law**
+
+Built to close the 0.72 recall@5 ceiling from [RAG8s](https://github.com/Athithya-Sakthivel/RAG8s) via structure-aware chunking and native citation-graph traversal.
 
 | | RAG8s | Legal GraphRAG |
 |---|---|---|
-| **Scope** | Full RAG platform (ingest → generate) | Retrieval only |
+| **Scope** | LLMOps platform (ingest → generate) | Retrieval only |
 | **Corpus** | Heterogeneous internal docs | Structured US case law |
-| **Chunking** | Flat 512-token windows | Parent–child, section-aligned |
+| **Chunking** |  512-token windows | Parent–child, section-aligned |
 | **Graph** | None | Native `CITES` edges, 1-hop |
 | **Routing** | Fixed hybrid pipeline | Deterministic intent classifier |
 | **Storage** | Qdrant + S3 + Valkey | PostgreSQL only |
@@ -14,7 +16,7 @@
 
 *Corpora differ — directional comparison, not a controlled ablation.*
 
-**No LLM, no generation, no containers. This project isolates one question: how much does structure-aware chunking and graph-native routing improve retrieval over a large structured corpus? Everything else is out of scope.**
+**No LLM, no generation, no containers. This project isolates one question: how much does structure-aware parent-child chunking and graph-native routing improve retrieval over a *large* structured corpus? Everything else is out of scope.**
 
 ---
 

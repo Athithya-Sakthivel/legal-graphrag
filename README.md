@@ -164,7 +164,7 @@ cd legal-graphrag
 # Run end-to-end evaluation (downloads pgvector backup, restores DB, runs 150 queries)
 export HF_TOKEN=   # https://huggingface.co/settings/tokens/new?tokenType=read
 export PG_PASS=e6a1c2e5bf8d  # or any password
-bash src/utils/evaluate_e2e.sh
+bash src/utils/quickstart.sh
 ```
 
 The script will:

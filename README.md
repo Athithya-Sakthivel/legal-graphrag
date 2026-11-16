@@ -2,25 +2,23 @@
 
 **A targeted retrieval experiment for a large structured legal corpora.**
 
-**Built as a retrieval-layer companion to** [RAG8s](https://github.com/Athithya-Sakthivel/RAG8s), this project isolates the impact of **structure-aware chunking** and **native citation graphs**. While RAG8s provides a complete end-to-end LLMOps pipeline for heterogeneous enterprise documents, Legal GraphRAG explores what happens when the corpus is highly connected—breaking the 0.72 recall ceiling of fixed-size windowing by treating legal citations as first-class graph edges.
+**Built as a retrieval-layer companion to** [RAG8s](https://github.com/Athithya-Sakthivel/RAG8s), this project isolates the impact of **structure-aware chunking** and **native citation graphs**. While RAG8s provides a complete end-to-end LLMOps pipeline for heterogeneous enterprise documents, Legal GraphRAG explores what happens when the corpus is highly connected, **breaking the 0.72 recall ceiling of fixed-size windowing** by treating legal citations as first-class graph edges.
 
 | | RAG8s | Legal GraphRAG |
 |---|---|---|
-| **Scale** | 20 heterogenous documents | **9,536 cases · 36K chunks · 45K citation edges** |
+| **Scale** | 20 heterogenous files | **9,536 cases · 36K chunks · 45K citation edges** |
 | **Scope** | E2E RAG platform (ingest → generate) | **Retrieval only** |
 | **Chunking** | 512-token windows | **Parent–child, section-aligned** |
 | **Graph** | None | **Native `CITES` edges, 1-hop** |
 | **Routing** | Fixed hybrid pipeline | **Deterministic intent classifier** |
-| **Storage** | Qdrant + S3 + Valkey | **PostgreSQL only** |
+| **Storage** | Qdrant Cluster + S3 | **Single node PostgreSQL** |
 | **Recall@5** | 0.72 | **0.91 average** |
 
-*Corpora differ — directional comparison, not a controlled ablation.*
-
-**No LLM, no generation, no containers.** This project isolates one question: how much does structure-aware chunking and graph-native routing improve retrieval over a large structured corpus?
+**No LLM, no generation, no containerization.** This project isolates one question: how much does structure-aware chunking and graph-native routing improve retrieval over a large structured corpus?
 
 ---
 
-## The Problem
+## Why Fixed-Size Chunking Fails on Connected Legal Text
 
 Legal research has three distinct query patterns, each requiring different retrieval strategies:
 
@@ -61,42 +59,24 @@ See full results: [`results/2026-11-12/eval_full.json`](results/2026-11-12/eval_
 | **Hybrid search** | Dense captures semantics but misses exact citations. Sparse captures exact matches but misses synonyms. **RRF fusion improves recall 15–20 points** over dense-only on legal text. | **2× retrieval latency.** Worth it for the recall gain. |
 | **384-dim OpenVINO int8** | BGE-small quantized to int8 runs efficiently on CPU (**~35MB weights, sub-10ms inference**). Chunking and ingestion quality matter **far more** than embedding model choice for legal retrieval. | Slight accuracy loss vs. fp32. **Negligible** compared to structure-aware chunking gains. |
 | **Deterministic routing** | Legal queries have predictable syntax. Regex detects intent at **100% accuracy with zero latency**, avoiding 200–500ms LLM router overhead and hallucination risk. | Cannot handle ambiguous queries. Acceptable for **precise legal terminology**. |
-| **No cross-encoder reranker** | General-purpose rerankers **degrade legal retrieval** when first-stage is strong ([Pipitone & Alami, 2024](https://arxiv.org/abs/2408.10343)). No legal-native reranker exists with **<100ms CPU latency** for 20 passages. | Sacrifices 2–3 recall@5 points for **3s/query latency savings**. |
-| **PostgreSQL-only** | pgvector + recursive CTEs + full-text search in a **single SQL statement**. Eliminates network round-trips. Scales to ~1M vectors on 8GB RAM; `pgvectorscale` provides seamless upgrade for tens of millions ([Timescale, 2024](https://github.com/timescale/pgvectorscale)). | Sacrifices horizontal scalability. Acceptable with **clear scale-up path**. |
-| **Batch indexing** | US case law changes periodically. Pipeline is **idempotent with fast skip-on-resume**, safely re-runs every few hours without CDC or incremental embedding complexity. | Not suitable for real-time streams. Perfect for **weekly/monthly legal updates**. |
+| **No cross-encoder reranker** | General-purpose rerankers **degrade legal retrieval** when first-stage is strong ([Pipitone & Alami](https://arxiv.org/abs/2408.10343)). No legal-native reranker exists with **<100ms CPU latency** for 20 passages. | Sacrifices 2–3 recall@5 points for **3s/query latency savings**. |
+| **PostgreSQL-only** | pgvector + recursive CTEs + full-text search in a **single SQL statement**. Eliminates network round-trips. Scales to ~1M vectors on 8GB RAM; `pgvectorscale` provides seamless upgrade for tens of millions ([Timescale, 2024](https://github.com/timescale/pgvectorscale)). | Sacrifices horizontal scalability. Acceptable with the **clear scale-up path**. |
+| **Batch indexing** | US case law changes periodically. Pipeline is **idempotent with fast skip**, safely re-runs every few hours without CDC or incremental embedding complexity. | Not suitable for real-time streams. Perfect for **daily/weekly/monthly legal updates**. |
 
 ---
 
-## Architecture
+# Architecture
 
-```
-Query
-  ↓
-Intent classifier (regex, deterministic)
-  extracts: case_name, citation, opinion_id
-  assigns: HOLDING | LOOKUP | VALIDITY
-  ↓
-Retrieval arms (executed in parallel where independent)
-  dense   → pgvector HNSW, 384-dim embeddings
-  sparse  → PostgreSQL tsvector, ts_rank_cd scoring
-  exact   → citation / case-name equality, trigram fallback
-  graph   → 1-hop CITES traversal via recursive CTE
-  ↓
-RRF fusion (per-query-class rank constants)
-  ↓
-Case diversity dedup (max 1-2 chunks per case)
-  ↓
-Parent expansion (child chunk → full section)
-  ↓
-Ranked results + per-arm diagnostics
-```
+The system is separated into two independent execution planes:
 
-**Storage:** One PostgreSQL database with three tables:
-- `cases` — case metadata (court, date, precedential status)
-- `chunks` — parent and child chunks with embeddings and tsvector
-- `case_edges` — citation graph (source_id, target_id, relation)
+**[Batch Indexing Plane](src/indexing_pipeline/README.md)** — An **idempotent, fast-skip-on-resume** pipeline that ingests US case law opinions from CourtListener, detects **15 section types** (holding, analysis, facts, footnotes, …), splits them into a **parent–child hierarchy** (1,200-token parents stored but not embedded, 350-token children as the retrieval unit), generates **384-dim L2-normalized dense embeddings** via a local **OpenVINO int8** model and **tsvector** sparse representations, and upserts into **PostgreSQL** with **deterministic chunk IDs** and **native `CITES` citation edges** between cases. The pipeline is **safe to re-run every few hours** to catch newly published opinions without CDC or streaming pipeline complexity.
 
-**Foreign keys on both edge endpoints make dangling citations impossible.**
+**[Online Retrieval Plane](src/retriever/README.md)** — A **sub-250ms p95, CPU-only** request path where a **deterministic regex router** classifies queries into **HOLDING** (semantic), **LOOKUP** (citation), or **VALIDITY** (overruling), dispatches each to the cheapest sufficient combination of retrieval arms — **dense HNSW** (pgvector, halfvec(384), relaxed-order iterative scan), **sparse tsvector** (ts_rank_cd), **exact citation / case-name match** (trigram fallback), and **1-hop recursive-CTE graph traversal** — fuses arms via **per-class Reciprocal Rank Fusion** with tunable k constants, applies **per-case diversity dedup**, and expands child chunks to their parent sections. No LLM, no cross-encoder reranker, no external vector database, no graph database — **one PostgreSQL instance composes vector, lexical, and graph retrieval in a single SQL statement**.
+
+
+---
+
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/ea60fe63-fcc9-4cf5-9a2d-daf36972f0b3" />
 
 ---
 
@@ -167,20 +147,12 @@ export PG_PASS=e6a1c2e5bf8d  # or any password
 bash src/utils/quickstart.sh
 ```
 
-The script will:
-1. Download a pre-built PostgreSQL backup with indexed corpus (9,536 cases, 36K chunks, 45K edges)
-2. Restore the database locally
-3. Generate a stratified gold set of 150 queries
-4. Run the retriever against all queries
-5. Output metrics with confidence intervals and failure mode analysis
-
-**Expected runtime:** ~5 minutes on a modern laptop.
-
 ---
+
 
 ## Limitations
 
-1. **Citation edges only.** No `OVERRULES` or `DISTINGUISHES` edge types — public citation data does not carry typed precedent edges. Validity detection is graph-seeded and prose-verified, not typed-edge traversed.
+1. **Citation edges only.** No `OVERRULES` or `DISTINGUISHES` edge types, public citation data does not carry typed precedent edges. Validity detection is graph-seeded and prose-verified, not typed-edge traversed.
 
 2. **Holding pool is narrow.** Only ~1.3% of opinions have a detected `holding` section. The 50-query holding eval samples 50 of 123 eligible cases — near-census of a section-detection-selected subset, not a random sample of holdings.
 
@@ -190,7 +162,7 @@ The script will:
 
 5. **Single-node.** Optimized for correctness and latency at 10K–400K cases. No sharding, no replication, no horizontal scale path.
 
-6. **Retrieval only.** Answer quality, faithfulness, and citation precision are unmeasured — there is no generation layer to measure.
+6. **Retrieval only.** Answer quality, faithfulness, and citation precision are unmeasured as there is no generation layer to measure.
 
 ---
 
